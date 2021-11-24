@@ -1,305 +1,248 @@
-package run.halo.app.controller.content;
+public class InstallController {
 
-import java.io.UnsupportedEncodingException;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import javax.servlet.http.HttpServletRequest;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
-import org.springframework.stereotype.Controller;
-import org.springframework.ui.Model;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.context.request.RequestContextHolder;
-import org.springframework.web.context.request.ServletRequestAttributes;
-import run.halo.app.cache.lock.CacheLock;
-import run.halo.app.controller.content.model.CategoryModel;
-import run.halo.app.controller.content.model.JournalModel;
-import run.halo.app.controller.content.model.LinkModel;
-import run.halo.app.controller.content.model.PhotoModel;
-import run.halo.app.controller.content.model.PostModel;
-import run.halo.app.controller.content.model.SheetModel;
-import run.halo.app.controller.content.model.TagModel;
-import run.halo.app.exception.NotFoundException;
-import run.halo.app.exception.UnsupportedException;
-import run.halo.app.model.dto.CategoryDTO;
-import run.halo.app.model.dto.post.BasePostMinimalDTO;
-import run.halo.app.model.entity.Post;
-import run.halo.app.model.entity.Sheet;
-import run.halo.app.model.enums.EncryptTypeEnum;
-import run.halo.app.model.enums.PostPermalinkType;
-import run.halo.app.model.enums.PostStatus;
-import run.halo.app.model.enums.SheetPermalinkType;
-import run.halo.app.service.AuthenticationService;
-import run.halo.app.service.CategoryService;
-import run.halo.app.service.OptionService;
-import run.halo.app.service.PostService;
-import run.halo.app.service.SheetService;
+    private final UserService userService;
 
-/**
- * @author ryanwang
- * @date 2020-01-07
- */
-@Slf4j
-@Controller
-@RequestMapping
-public class ContentContentController {
-
-    private final PostModel postModel;
-
-    private final SheetModel sheetModel;
-
-    private final CategoryModel categoryModel;
-
-    private final TagModel tagModel;
-
-    private final JournalModel journalModel;
-
-    private final PhotoModel photoModel;
-
-    private final LinkModel linkModel;
-
-    private final OptionService optionService;
+    private final CategoryService categoryService;
 
     private final PostService postService;
 
     private final SheetService sheetService;
 
-    private final AuthenticationService authenticationService;
+    private final PostCommentService postCommentService;
 
-    private final CategoryService categoryService;
+    private final OptionService optionService;
 
-    public ContentContentController(PostModel postModel,
-        SheetModel sheetModel,
-        CategoryModel categoryModel,
-        TagModel tagModel,
-        JournalModel journalModel,
-        PhotoModel photoModel,
-        LinkModel linkModel,
-        OptionService optionService,
+    private final MenuService menuService;
+
+    private final ApplicationEventPublisher eventPublisher;
+
+    public InstallController(UserService userService,
+        CategoryService categoryService,
         PostService postService,
         SheetService sheetService,
-        AuthenticationService authenticationService,
-        CategoryService categoryService) {
-        this.postModel = postModel;
-        this.sheetModel = sheetModel;
-        this.categoryModel = categoryModel;
-        this.tagModel = tagModel;
-        this.journalModel = journalModel;
-        this.photoModel = photoModel;
-        this.linkModel = linkModel;
-        this.optionService = optionService;
+        PostCommentService postCommentService,
+        OptionService optionService,
+        MenuService menuService,
+        ApplicationEventPublisher eventPublisher) {
+        this.userService = userService;
+        this.categoryService = categoryService;
         this.postService = postService;
         this.sheetService = sheetService;
-        this.authenticationService = authenticationService;
-        this.categoryService = categoryService;
+        this.postCommentService = postCommentService;
+        this.optionService = optionService;
+        this.menuService = menuService;
+        this.eventPublisher = eventPublisher;
     }
 
-    @GetMapping("{prefix}")
-    public String content(@PathVariable("prefix") String prefix,
-        @RequestParam(value = "token", required = false) String token,
-        Model model) {
-        if (optionService.getArchivesPrefix().equals(prefix)) {
-            return postModel.archives(1, model);
-        }
-        if (optionService.getCategoriesPrefix().equals(prefix)) {
-            return categoryModel.list(model);
-        }
-        if (optionService.getTagsPrefix().equals(prefix)) {
-            return tagModel.list(model);
-        }
-        if (optionService.getJournalsPrefix().equals(prefix)) {
-            return journalModel.list(1, model);
-        }
-        if (optionService.getPhotosPrefix().equals(prefix)) {
-            return photoModel.list(1, model);
-        }
-        if (optionService.getLinksPrefix().equals(prefix)) {
-            return linkModel.list(model);
-        }
-        if (optionService.getSheetPermalinkType().equals(SheetPermalinkType.ROOT)) {
-            Sheet sheet = sheetService.getBySlug(prefix);
-            return sheetModel.content(sheet, token, model);
+    @PostMapping
+    @ResponseBody
+    @CacheLock
+    @ApiOperation("Initializes the blog")
+    public BaseResponse<String> installBlog(@RequestBody InstallParam installParam) {
+        // Validate manually
+        ValidationUtils.validate(installParam, CreateCheck.class);
+
+        // Check is installed
+        boolean isInstalled = optionService
+            .getByPropertyOrDefault(PrimaryProperties.IS_INSTALLED, Boolean.class, false);
+
+        if (isInstalled) {
+            throw new BadRequestException("该博客已初始化，不能再次安装！");
         }
 
-        throw buildPathNotFoundException();
+        // Initialize settings
+        initSettings(installParam);
+
+        // Create default user
+        User user = createUser(installParam);
+
+        // Create default category
+        Category category = createDefaultCategoryIfAbsent();
+
+        // Create default post
+        PostDetailVO post = createDefaultPostIfAbsent(category);
+
+        // Create default sheet
+        createDefaultSheet();
+
+        // Create default postComment
+        createDefaultComment(post);
+
+        // Create default menu
+        createDefaultMenu();
+
+        eventPublisher.publishEvent(
+            new LogEvent(this, user.getId().toString(), LogType.BLOG_INITIALIZED, "博客已成功初始化")
+        );
+
+        return BaseResponse.ok("安装完成！");
     }
 
-    @GetMapping("{prefix}/page/{page:\\d+}")
-    public String content(@PathVariable("prefix") String prefix,
-        @PathVariable(value = "page") Integer page,
-        HttpServletRequest request,
-        Model model) {
-        if (optionService.getArchivesPrefix().equals(prefix)) {
-            return postModel.archives(page, model);
+    private void createDefaultMenu() {
+        long menuCount = menuService.count();
+
+        if (menuCount > 0) {
+            return;
         }
 
-        if (optionService.getJournalsPrefix().equals(prefix)) {
-            return journalModel.list(page, model);
-        }
+        MenuParam menuIndex = new MenuParam();
 
-        if (optionService.getPhotosPrefix().equals(prefix)) {
-            return photoModel.list(page, model);
-        }
+        menuIndex.setName("首页");
+        menuIndex.setUrl("/");
+        menuIndex.setPriority(1);
 
-        throw buildPathNotFoundException();
+        menuService.create(menuIndex.convertTo());
+
+        MenuParam menuArchive = new MenuParam();
+
+        menuArchive.setName("文章归档");
+        menuArchive.setUrl("/archives");
+        menuArchive.setPriority(2);
+        menuService.create(menuArchive.convertTo());
+
+        MenuParam menuCategory = new MenuParam();
+        menuCategory.setName("默认分类");
+        menuCategory.setUrl("/categories/default");
+        menuCategory.setPriority(3);
+        menuService.create(menuCategory.convertTo());
+
+        MenuParam menuSheet = new MenuParam();
+        menuSheet.setName("关于页面");
+        menuSheet.setUrl("/s/about");
+        menuSheet.setPriority(4);
+        menuService.create(menuSheet.convertTo());
     }
 
-    @GetMapping("{prefix}/{slug}")
-    public String content(@PathVariable("prefix") String prefix,
-        @PathVariable("slug") String slug,
-        @RequestParam(value = "token", required = false) String token,
-        Model model) {
-        PostPermalinkType postPermalinkType = optionService.getPostPermalinkType();
-        if (optionService.getArchivesPrefix().equals(prefix)) {
-            if (postPermalinkType.equals(PostPermalinkType.DEFAULT)) {
-                Post post = postService.getBySlug(slug);
-                return postModel.content(post, token, model);
-            }
-            if (postPermalinkType.equals(PostPermalinkType.ID_SLUG)
-                && StringUtils.isNumeric(slug)) {
-                Post post = postService.getById(Integer.parseInt(slug));
-                return postModel.content(post, token, model);
-            }
+
+    @Nullable
+    private void createDefaultComment(@Nullable PostDetailVO post) {
+        if (post == null) {
+            return;
         }
 
-        if (optionService.getCategoriesPrefix().equals(prefix)) {
-            return categoryModel.listPost(model, slug, 1);
+        long commentCount = postCommentService.count();
+
+        if (commentCount > 0) {
+            return;
         }
 
-        if (optionService.getTagsPrefix().equals(prefix)) {
-            return tagModel.listPost(model, slug, 1);
-        }
-
-        if (postPermalinkType.equals(PostPermalinkType.YEAR) && prefix.length() == 4
-            && StringUtils.isNumeric(prefix)) {
-            Post post = postService.getBy(Integer.parseInt(prefix), slug);
-            return postModel.content(post, token, model);
-        }
-
-        if (optionService.getSheetPermalinkType().equals(SheetPermalinkType.SECONDARY)
-            && optionService.getSheetPrefix().equals(prefix)) {
-            Sheet sheet = sheetService.getBySlug(slug);
-            return sheetModel.content(sheet, token, model);
-        }
-
-        throw buildPathNotFoundException();
+        PostComment comment = new PostComment();
+        comment.setAuthor("Halo");
+        comment.setAuthorUrl("https://halo.run");
+        comment.setContent(
+            "欢迎使用 Halo，这是你的第一条评论，头像来自 [Gravatar](https://cn.gravatar.com)，"
+                + "你也可以通过注册 [Gravatar]"
+                + "(https://cn.gravatar.com) 来显示自己的头像。");
+        comment.setEmail("hi@halo.run");
+        comment.setPostId(post.getId());
+        postCommentService.create(comment);
     }
 
-    @GetMapping("{prefix}/{slug}/page/{page:\\d+}")
-    public String content(@PathVariable("prefix") String prefix,
-        @PathVariable("slug") String slug,
-        @PathVariable("page") Integer page,
-        Model model) {
-        if (optionService.getCategoriesPrefix().equals(prefix)) {
-            return categoryModel.listPost(model, slug, page);
+    @Nullable
+    private PostDetailVO createDefaultPostIfAbsent(@Nullable Category category) {
+
+        long publishedCount = postService.countByStatus(PostStatus.PUBLISHED);
+
+        if (publishedCount > 0) {
+            return null;
         }
 
-        if (optionService.getTagsPrefix().equals(prefix)) {
-            return tagModel.listPost(model, slug, page);
-        }
+        PostParam postParam = new PostParam();
+        postParam.setSlug("hello-halo");
+        postParam.setTitle("Hello Halo");
+        postParam.setStatus(PostStatus.PUBLISHED);
+        postParam.setOriginalContent("## Hello Halo\n"
+            + "\n"
+            + "如果你看到了这一篇文章，那么证明你已经安装成功了，感谢使用 [Halo](https://halo.run) 进行创作，希望能够使用愉快。\n"
+            + "\n"
+            + "## 相关链接\n"
+            + "\n"
+            + "- 官网：[https://halo.run](https://halo.run)\n"
+            + "- 文档：[https://docs.halo.run](https://docs.halo.run)\n"
+            + "- 社区：[https://bbs.halo.run](https://bbs.halo.run)\n"
+            + "- 主题仓库：[https://halo.run/themes.html](https://halo.run/themes.html)\n"
+            + "- 开源地址：[https://github.com/halo-dev/halo](https://github.com/halo-dev/halo)\n"
+            + "\n"
+            + "在使用过程中，有任何问题都可以通过以上链接找寻答案，或者联系我们。\n"
+            + "\n"
+            + "> 这是一篇自动生成的文章，请删除这篇文章之后开始你的创作吧！\n"
+            + "\n");
 
-        throw buildPathNotFoundException();
+        Set<Integer> categoryIds = new HashSet<>();
+        if (category != null) {
+            categoryIds.add(category.getId());
+            postParam.setCategoryIds(categoryIds);
+        }
+        return postService
+            .createBy(postParam.convertTo(), Collections.emptySet(), categoryIds, false);
     }
 
-    @GetMapping("{year:\\d+}/{month:\\d+}/{slug}")
-    public String content(@PathVariable("year") Integer year,
-        @PathVariable("month") Integer month,
-        @PathVariable("slug") String slug,
-        @RequestParam(value = "token", required = false) String token,
-        Model model) {
-        PostPermalinkType postPermalinkType = optionService.getPostPermalinkType();
-        if (postPermalinkType.equals(PostPermalinkType.DATE)) {
-            Post post = postService.getBy(year, month, slug);
-            return postModel.content(post, token, model);
+    @Nullable
+    private void createDefaultSheet() {
+        long publishedCount = sheetService.countByStatus(PostStatus.PUBLISHED);
+        if (publishedCount > 0) {
+            return;
         }
 
-        throw buildPathNotFoundException();
+        SheetParam sheetParam = new SheetParam();
+        sheetParam.setSlug("about");
+        sheetParam.setTitle("关于页面");
+        sheetParam.setStatus(PostStatus.PUBLISHED);
+        sheetParam.setOriginalContent("## 关于页面\n"
+            + "\n"
+            + "这是一个自定义页面，你可以在后台的 `页面` -> `所有页面` -> `自定义页面` 找到它，"
+            + "你可以用于新建关于页面、留言板页面等等。发挥你自己的想象力！\n"
+            + "\n"
+            + "> 这是一篇自动生成的页面，你可以在后台删除它。");
+        sheetService.createBy(sheetParam.convertTo(), false);
     }
 
-    @GetMapping("{year:\\d+}/{month:\\d+}/{day:\\d+}/{slug}")
-    public String content(@PathVariable("year") Integer year,
-        @PathVariable("month") Integer month,
-        @PathVariable("day") Integer day,
-        @PathVariable("slug") String slug,
-        @RequestParam(value = "token", required = false) String token,
-        Model model) {
-        PostPermalinkType postPermalinkType = optionService.getPostPermalinkType();
-        if (postPermalinkType.equals(PostPermalinkType.DAY)) {
-            Post post = postService.getBy(year, month, day, slug);
-            return postModel.content(post, token, model);
+    @Nullable
+    private Category createDefaultCategoryIfAbsent() {
+        long categoryCount = categoryService.count();
+        if (categoryCount > 0) {
+            return null;
         }
 
-        throw buildPathNotFoundException();
+        CategoryParam category = new CategoryParam();
+        category.setName("默认分类");
+        category.setSlug("default");
+        category.setDescription("这是你的默认分类，如不需要，删除即可。");
+        ValidationUtils.validate(category);
+        return categoryService.create(category.convertTo());
     }
 
-    @PostMapping(value = "content/{type}/{slug:.*}/authentication")
-    @CacheLock(traceRequest = true, expired = 2)
-    public String password(@PathVariable("type") String type,
-        @PathVariable("slug") String slug,
-        @RequestParam(value = "password") String password) throws UnsupportedEncodingException {
-
-        String redirectUrl;
-
-        if (EncryptTypeEnum.POST.getName().equals(type)) {
-            redirectUrl = doAuthenticationPost(slug, password);
-        } else if (EncryptTypeEnum.CATEGORY.getName().equals(type)) {
-            redirectUrl = doAuthenticationCategory(slug, password);
-        } else {
-            throw new UnsupportedException("未知的加密类型");
-        }
-        return "redirect:" + redirectUrl;
+    private User createUser(InstallParam installParam) {
+        // Get user
+        return userService.getCurrentUser().map(user -> {
+            // Update this user
+            installParam.update(user);
+            // Set password manually
+            userService.setPassword(user, installParam.getPassword());
+            // Update user
+            return userService.update(user);
+        }).orElseGet(() -> {
+            String gravatar =
+                "//cn.gravatar.com/avatar/" + DigestUtils.md5Hex(installParam.getEmail())
+                    + "?s=256&d=mm";
+            installParam.setAvatar(gravatar);
+            return userService.createBy(installParam);
+        });
     }
 
-    private NotFoundException buildPathNotFoundException() {
-        var requestAttributes = RequestContextHolder.currentRequestAttributes();
+    private void initSettings(InstallParam installParam) {
+        // Init default properties
+        Map<PropertyEnum, String> properties = new HashMap<>(11);
+        properties.put(PrimaryProperties.IS_INSTALLED, Boolean.TRUE.toString());
+        properties.put(BlogProperties.BLOG_LOCALE, installParam.getLocale());
+        properties.put(BlogProperties.BLOG_TITLE, installParam.getTitle());
+        properties.put(BlogProperties.BLOG_URL,
+            StringUtils.isBlank(installParam.getUrl()) ? optionService.getBlogBaseUrl() :
+                installParam.getUrl());
+        properties.put(OtherProperties.GLOBAL_ABSOLUTE_PATH_ENABLED, Boolean.FALSE.toString());
 
-        var requestUri = "";
-        if (requestAttributes instanceof ServletRequestAttributes) {
-            requestUri =
-                ((ServletRequestAttributes) requestAttributes).getRequest().getRequestURI();
-        }
-        return new NotFoundException("无法定位到该路径：" + requestUri);
+        // Create properties
+        optionService.saveProperties(properties);
     }
 
-    private String doAuthenticationPost(
-        String slug, String password) throws UnsupportedEncodingException {
-        Post post = postService.getBy(PostStatus.INTIMATE, slug);
-
-        post.setSlug(URLEncoder.encode(post.getSlug(), StandardCharsets.UTF_8.name()));
-
-        authenticationService.postAuthentication(post, password);
-
-        BasePostMinimalDTO postMinimalDTO = postService.convertToMinimal(post);
-
-        StringBuilder redirectUrl = new StringBuilder();
-
-        if (!optionService.isEnabledAbsolutePath()) {
-            redirectUrl.append(optionService.getBlogBaseUrl());
-        }
-
-        redirectUrl.append(postMinimalDTO.getFullPath());
-
-        return redirectUrl.toString();
-    }
-
-    private String doAuthenticationCategory(String slug, String password) {
-        CategoryDTO
-            category = categoryService.convertTo(categoryService.getBySlugOfNonNull(slug, true));
-
-        authenticationService.categoryAuthentication(category.getId(), password);
-
-        StringBuilder redirectUrl = new StringBuilder();
-
-        if (!optionService.isEnabledAbsolutePath()) {
-            redirectUrl.append(optionService.getBlogBaseUrl());
-        }
-
-        redirectUrl.append(category.getFullPath());
-
-        return redirectUrl.toString();
-    }
 }
